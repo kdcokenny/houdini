@@ -51,28 +51,39 @@ def validate_game_score(p, score):
     return True, score, "Valid"
 
 
-async def validate_game_session(p):
+async def validate_per_room_cooldown(p):
     """
-    Validate that player has been in game room for minimum time.
-    Prevents instant score submission exploits.
-    Returns (is_valid, time_in_room, reason)
+    Validate that player hasn't submitted a score to this room too recently.
+    This is the Club Penguin solution: you can leave games anytime, but can't
+    repeatedly farm the SAME game. Prevents rapid cycling of the same room.
+    Returns (is_valid, time_since_last, reason)
     """
-    game_session_key = f'{p.id}.game_session.{p.room.id}'
-    session_start = await p.server.redis.get(game_session_key)
+    room_cooldown_key = f'{p.id}.game_cooldown.{p.room.id}'
+    last_score_time = await p.server.redis.get(room_cooldown_key)
 
-    if session_start is None:
-        return False, 0, "No game session found"
+    if last_score_time is None:
+        # First time playing this game, allow it
+        return True, None, "Valid"
 
-    time_in_room = time.time() - float(session_start)
+    time_since_last = time.time() - float(last_score_time)
 
-    # Minimum 15 seconds in room before accepting score
-    # Adjust based on fastest legitimate game completion times
-    min_game_time = 15
+    # Must wait 45 seconds before playing the same game again
+    # This prevents rapid farming of a single game
+    room_cooldown = 45
 
-    if time_in_room < min_game_time:
-        return False, time_in_room, f"Game completed too quickly ({time_in_room:.1f}s < {min_game_time}s)"
+    if time_since_last < room_cooldown:
+        return False, time_since_last, f"Please wait {room_cooldown - int(time_since_last)}s before playing this game again"
 
-    return True, time_in_room, "Valid"
+    return True, time_since_last, "Valid"
+
+
+async def set_per_room_cooldown(p):
+    """
+    Set the cooldown timestamp after successful score submission.
+    """
+    room_cooldown_key = f'{p.id}.game_cooldown.{p.room.id}'
+    await p.server.redis.set(room_cooldown_key, time.time())
+    await p.server.redis.expire(room_cooldown_key, 3600)  # Cleanup after 1 hour
 
 
 async def validate_game_rate_limit(p):
@@ -136,11 +147,6 @@ async def handle_overdose_key(p, room: Room):
         if not await p.server.redis.exists(overdose_key):
             await p.server.redis.set(overdose_key, time.time())
 
-        # Track game session start time for minimum play time validation
-        game_session_key = f'{p.id}.game_session.{room.id}'
-        await p.server.redis.set(game_session_key, time.time())
-        await p.server.redis.expire(game_session_key, 300)  # 5 minute expiry
-
 
 @handlers.disconnected
 @handlers.player_attribute(joined_world=True)
@@ -186,10 +192,11 @@ async def handle_get_game_over(p, score: int):
         return
 
     if p.room.game and not p.table:
-        # Validate game session timing
-        session_valid, time_in_room, session_reason = await validate_game_session(p)
-        if not session_valid:
-            return await cheat_ban(p, p.id, comment=f"Game session invalid: {session_reason}")
+        # Validate per-room cooldown (prevents farming same game repeatedly)
+        cooldown_valid, time_since, cooldown_reason = await validate_per_room_cooldown(p)
+        if not cooldown_valid:
+            # Don't ban for this - just reject with cooling callback
+            return await game_over_cooling(p)
 
         # Validate global rate limit
         rate_valid, games_count, rate_reason = await validate_game_rate_limit(p)
@@ -202,6 +209,9 @@ async def handle_get_game_over(p, score: int):
             return await cheat_ban(p, p.id, comment=f"Invalid game score: {reason}")
 
         coins_earned = determine_coins_earned(p, validated_score)
+
+        # Set per-room cooldown after validation but before overdose check
+        await set_per_room_cooldown(p)
 
         if not is_card_jitsu:
             if await determine_coins_overdose(p, coins_earned):
