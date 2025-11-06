@@ -14,9 +14,96 @@ from houdini.handlers.play.navigation import handle_join_room
 
 default_score_games = {904, 905, 906, 912, 916, 917, 918, 919, 950, 952}
 
+# Maximum allowed scores per game room to prevent score manipulation
+# Format: room_id: (max_score, coins_per_score_unit)
+max_scores_per_game = {
+    903: 10000,   # Hydro Hopper (10000 score = 1000 coins max)
+    904: 1000,    # Cart Surfer (full score payout)
+    905: 1000,    # Catchin' Waves (full score payout)
+    906: 250,     # Ice Fishing (full score payout)
+    912: 800,     # Aqua Grabber (full score payout)
+    916: 1000,    # Jet Pack Adventure
+    917: 1000,    # Puffle Rescue
+    918: 800,     # Smoothie Smash
+    919: 800,     # Puffle Round Up
+    950: 800,     # Dance Contest
+    952: 800,     # Pufflescape
+}
+
 
 def determine_coins_earned(p, score):
     return score if p.room.id in default_score_games else score // 10
+
+
+def validate_game_score(p, score):
+    """
+    Validate that score is within reasonable limits for the game.
+    Returns (is_valid, capped_score, reason)
+    """
+    max_score = max_scores_per_game.get(p.room.id, 15000)  # Default max for unlisted games
+
+    if score < 0:
+        return False, 0, "Negative score"
+
+    if score > max_score:
+        return False, max_score, f"Score exceeds maximum {max_score}"
+
+    return True, score, "Valid"
+
+
+async def validate_game_session(p):
+    """
+    Validate that player has been in game room for minimum time.
+    Prevents instant score submission exploits.
+    Returns (is_valid, time_in_room, reason)
+    """
+    game_session_key = f'{p.id}.game_session.{p.room.id}'
+    session_start = await p.server.redis.get(game_session_key)
+
+    if session_start is None:
+        return False, 0, "No game session found"
+
+    time_in_room = time.time() - float(session_start)
+
+    # Minimum 15 seconds in room before accepting score
+    # Adjust based on fastest legitimate game completion times
+    min_game_time = 15
+
+    if time_in_room < min_game_time:
+        return False, time_in_room, f"Game completed too quickly ({time_in_room:.1f}s < {min_game_time}s)"
+
+    return True, time_in_room, "Valid"
+
+
+async def validate_game_rate_limit(p):
+    """
+    Validate that player hasn't exceeded maximum games per hour.
+    Prevents rapid game cycling exploits.
+    Returns (is_valid, games_played, reason)
+    """
+    rate_limit_key = f'{p.id}.game_rate_limit'
+    games_played = await p.server.redis.get(rate_limit_key)
+
+    if games_played is None:
+        games_played = 0
+    else:
+        games_played = int(games_played)
+
+    # Maximum 60 games per hour (1 per minute average)
+    # Allows bursts but prevents sustained abuse
+    max_games_per_hour = 60
+
+    if games_played >= max_games_per_hour:
+        return False, games_played, f"Too many games in last hour ({games_played}/{max_games_per_hour})"
+
+    # Increment counter
+    await p.server.redis.incr(rate_limit_key)
+
+    # Set expiry to 1 hour if this is the first game
+    if games_played == 0:
+        await p.server.redis.expire(rate_limit_key, 3600)
+
+    return True, games_played + 1, "Valid"
 
 
 async def determine_coins_overdose(p, coins):
@@ -24,7 +111,9 @@ async def determine_coins_overdose(p, coins):
     last_overdose = await p.server.redis.get(overdose_key)
 
     if last_overdose is None:
-        return True
+        # First game - set initial timestamp and allow
+        await p.server.redis.set(overdose_key, time.time())
+        return False
 
     minutes_since_last_dose = ((time.time() - float(last_overdose)) // 60) + 1
     max_game_coins = p.server.config.max_coins_per_min * minutes_since_last_dose
@@ -32,26 +121,36 @@ async def determine_coins_overdose(p, coins):
     if coins > max_game_coins:
         return True
 
-    await p.server.redis.delete(overdose_key)
+    # Update timestamp but don't delete - accumulate over time
+    await p.server.redis.set(overdose_key, time.time())
     return False
 
 
 @handlers.handler(XTPacket('j', 'jr'), before=handle_join_room)
 async def handle_overdose_key(p, room: Room):
-    if p.room.game and not room.game:
+    # Only set timestamp when joining a game room, never delete
+    # This prevents overdose bypass via rapid room cycling
+    if room.game:
         overdose_key = f'{p.id}.overdose'
-        await p.server.redis.delete(overdose_key)
-    elif room.game:
-        overdose_key = f'{p.id}.overdose'
-        await p.server.redis.set(overdose_key, time.time())
+        # Only set if not already set (preserve existing timestamp)
+        if not await p.server.redis.exists(overdose_key):
+            await p.server.redis.set(overdose_key, time.time())
+
+        # Track game session start time for minimum play time validation
+        game_session_key = f'{p.id}.game_session.{room.id}'
+        await p.server.redis.set(game_session_key, time.time())
+        await p.server.redis.expire(game_session_key, 300)  # 5 minute expiry
 
 
 @handlers.disconnected
 @handlers.player_attribute(joined_world=True)
 async def disconnect_overdose_key(p):
+    # Set expiry on disconnect instead of deleting
+    # This prevents disconnect/reconnect bypass while allowing eventual cleanup
     if p.room is not None and p.room.game:
         overdose_key = f'{p.id}.overdose'
-        await p.server.redis.delete(overdose_key)
+        # Keep the key for 1 hour after disconnect
+        await p.server.redis.expire(overdose_key, 3600)
 
 
 async def game_over_cooling(p):
@@ -87,7 +186,22 @@ async def handle_get_game_over(p, score: int):
         return
 
     if p.room.game and not p.table:
-        coins_earned = determine_coins_earned(p, score)
+        # Validate game session timing
+        session_valid, time_in_room, session_reason = await validate_game_session(p)
+        if not session_valid:
+            return await cheat_ban(p, p.id, comment=f"Game session invalid: {session_reason}")
+
+        # Validate global rate limit
+        rate_valid, games_count, rate_reason = await validate_game_rate_limit(p)
+        if not rate_valid:
+            return await cheat_ban(p, p.id, comment=f"Game rate limit exceeded: {rate_reason}")
+
+        # Validate score before processing
+        is_valid, validated_score, reason = validate_game_score(p, score)
+        if not is_valid:
+            return await cheat_ban(p, p.id, comment=f"Invalid game score: {reason}")
+
+        coins_earned = determine_coins_earned(p, validated_score)
 
         if not is_card_jitsu:
             if await determine_coins_overdose(p, coins_earned):
